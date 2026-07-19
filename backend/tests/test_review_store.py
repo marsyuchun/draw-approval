@@ -24,6 +24,18 @@ class ReviewStoreTest(unittest.TestCase):
             self.assertEqual(loaded["id"], upload.review_id)
             self.assertEqual(loaded["file"]["name"], "part.dxf")
 
+    def test_delete_report_removes_report_and_related_uploads(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ReviewStore(Path(temp_dir))
+            upload = store.save_upload("part.dxf", b"0\nDIM 12 mm", review_id="review-001")
+            store.save_report({"id": "review-001", "file": {"name": "part.dxf"}})
+
+            store.delete_report("review-001")
+
+            self.assertFalse(upload.path.exists())
+            with self.assertRaises(FileNotFoundError):
+                store.get_report("review-001")
+
 
 if __name__ == "__main__":
     unittest.main()

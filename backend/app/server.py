@@ -75,6 +75,20 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         self.store.save_report(report)
         self._send_json(report, 201)
 
+    def do_DELETE(self) -> None:
+        path = urlparse(self.path).path
+        if not path.startswith("/api/reviews/"):
+            self._send_json({"error": "not_found"}, 404)
+            return
+
+        review_id = path.rsplit("/", 1)[-1]
+        try:
+            self.store.delete_report(review_id)
+        except FileNotFoundError:
+            self._send_json({"error": "review_not_found"}, 404)
+            return
+        self._send_empty(204)
+
     def _read_multipart_upload(self) -> dict[str, Any]:
         content_type = self.headers.get("Content-Type", "")
         if not content_type.startswith("multipart/form-data"):
@@ -153,7 +167,7 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
 
     def _send_cors_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     def log_message(self, format: str, *args: Any) -> None:

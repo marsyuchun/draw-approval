@@ -1,49 +1,68 @@
 <script setup>
 import { computed, onMounted, ref } from "vue";
 
-const apiStatus = ref("检查服务中");
+const LOGIN_USERNAME = "zhaoyali998";
+const LOGIN_PASSWORD = "naura999";
+
+const apiStatus = ref("系统状态检查中");
 const isApiOnline = ref(false);
+const isAuthenticated = ref(sessionStorage.getItem("draw-approval-authenticated") === "true");
+const loginUsername = ref("");
+const loginPassword = ref("");
+const loginError = ref("");
 const isSubmitting = ref(false);
 const pdfFile = ref(null);
 const dxfFile = ref(null);
 const history = ref([]);
 const report = ref(null);
+const activeView = ref("history");
 const historyError = ref("");
 const actionError = ref("");
 
-const summary = computed(() => report.value?.summary ?? {
-  totalIssues: 0,
-  critical: 0,
-  warning: 0,
-  notice: 0,
-});
-
+const summary = computed(() => report.value?.summary ?? { totalIssues: 0, critical: 0, warning: 0, notice: 0 });
 const reportMeta = computed(() => {
-  if (!report.value) return "暂无报告";
+  if (!report.value) return "";
   const companion = report.value.file.companion ? ` · 底图：${report.value.file.companion.name}` : "";
   return `${report.value.file.name}${companion} · ${formatBytes(report.value.file.size)}`;
 });
-
 const parserMeta = computed(() => {
-  if (!report.value) return "等待上传 PDF + DXF";
+  if (!report.value) return "";
   const engine = report.value.engine;
   return `解析来源：${engine.source} · 置信度：${engine.confidence || "unknown"} · 标注坐标：${report.value.visual.coordinateSource || "none"}`;
 });
 
 async function request(path, options) {
   const response = await fetch(path, options);
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error || "服务请求失败");
+  const payload = response.status === 204 ? null : await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload?.error || "服务请求失败");
   return payload;
+}
+
+async function signIn() {
+  loginError.value = "";
+  if (loginUsername.value !== LOGIN_USERNAME || loginPassword.value !== LOGIN_PASSWORD) {
+    loginError.value = "账号或密码不正确，请重新输入。";
+    return;
+  }
+  sessionStorage.setItem("draw-approval-authenticated", "true");
+  isAuthenticated.value = true;
+  await initializeWorkspace();
+}
+
+function signOut() {
+  sessionStorage.removeItem("draw-approval-authenticated");
+  isAuthenticated.value = false;
+  loginPassword.value = "";
+  activeView.value = "history";
 }
 
 async function checkHealth() {
   try {
     await request("/health");
-    apiStatus.value = "后端已连接";
+    apiStatus.value = "系统运行正常";
     isApiOnline.value = true;
   } catch {
-    apiStatus.value = "后端未连接";
+    apiStatus.value = "系统服务异常";
     isApiOnline.value = false;
   }
 }
@@ -64,16 +83,16 @@ async function submitReview() {
     actionError.value = "请选择 PDF 底图和 DXF 数据文件。";
     return;
   }
-
   const body = new FormData();
   body.append("pdfFile", pdfFile.value);
   body.append("dxfFile", dxfFile.value);
   isSubmitting.value = true;
   try {
     report.value = await request("/api/reviews", { method: "POST", body });
+    activeView.value = "detail";
     await loadHistory();
   } catch (error) {
-    actionError.value = `上传失败：${error.message}`;
+    actionError.value = `审查失败：${error.message}`;
   } finally {
     isSubmitting.value = false;
   }
@@ -83,8 +102,21 @@ async function openReport(reviewId) {
   actionError.value = "";
   try {
     report.value = await request(`/api/reviews/${encodeURIComponent(reviewId)}`);
+    activeView.value = "detail";
   } catch (error) {
     actionError.value = `无法打开报告：${error.message}`;
+  }
+}
+
+async function deleteReview(reviewId) {
+  actionError.value = "";
+  try {
+    await request(`/api/reviews/${encodeURIComponent(reviewId)}`, { method: "DELETE" });
+    if (report.value?.id === reviewId) report.value = null;
+    activeView.value = "history";
+    await loadHistory();
+  } catch (error) {
+    actionError.value = `删除失败：${error.message}`;
   }
 }
 
@@ -95,16 +127,15 @@ function updateFile(event, kind) {
 }
 
 function visualMessage(visual) {
-  if (!visual) return "当前报告没有可视化标注数据。";
   const messages = {
-    no_text_coordinates: "当前文件没有可用坐标，因此不能可靠地在图面中框选问题。请优先上传 DXF；PDF 需要文本层或 OCR 才能定位。",
-    no_issue_coordinates: "图纸已解析，但当前问题没有可用坐标。请检查尺寸是否以文本或尺寸实体保留在 DXF 中。",
-    no_dxf_entities: "DXF 中没有可渲染的线段或文字实体。请检查导出设置。",
-    dxf_renderer_dependency_missing: "DXF 语义已解析，但 CAD 底图渲染依赖缺失。请安装后端依赖后重启服务。",
-    dxf_renderer_failed: "DXF 语义已解析，但 CAD 底图渲染失败。请检查 DXF 是否包含不兼容图元。",
-    pdf_preview_failed: "PDF 底图渲染失败。请重新从 SolidWorks 导出标准 PDF。",
+    no_text_coordinates: "当前文件没有可用坐标，无法可靠地在图面中框选问题。",
+    no_issue_coordinates: "图纸已解析，但当前问题没有可用坐标。",
+    no_dxf_entities: "DXF 中没有可渲染的线段或文字实体。",
+    dxf_renderer_dependency_missing: "CAD 底图渲染依赖缺失。",
+    dxf_renderer_failed: "CAD 底图渲染失败。",
+    pdf_preview_failed: "PDF 底图渲染失败。",
   };
-  return messages[visual.reason] || "当前报告没有可视化标注数据。";
+  return messages[visual?.reason] || "当前报告没有可视化标注数据。";
 }
 
 function formatBytes(bytes) {
@@ -114,121 +145,106 @@ function formatBytes(bytes) {
 }
 
 function formatTime(value) {
-  return new Intl.DateTimeFormat("zh-CN", {
-    month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
-  }).format(new Date(value));
+  return new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }).format(new Date(value));
+}
+
+async function initializeWorkspace() {
+  await checkHealth();
+  await loadHistory();
 }
 
 onMounted(async () => {
-  await checkHealth();
-  await loadHistory();
+  if (isAuthenticated.value) await initializeWorkspace();
 });
 </script>
 
 <template>
-  <main class="app-shell">
+  <main v-if="!isAuthenticated" class="login-page">
+    <div class="login-backdrop" aria-hidden="true"></div>
+    <div class="login-grid" aria-hidden="true"></div>
+    <section class="login-shell" aria-label="系统登录">
+      <div class="login-brand">
+        <img class="naura-logo" src="/images/naura-logo.png" alt="北方华创 NAURA" />
+        <div class="brand-divider"></div>
+        <p class="brand-eyebrow">DRAWING INTELLIGENCE PLATFORM</p>
+        <h1>智审图</h1>
+        <p class="brand-description">AI辅助机械设计图纸自动审查系统</p>
+        <div class="brand-signal"><span></span> SYSTEM READY</div>
+      </div>
+      <form class="login-card" @submit.prevent="signIn">
+        <div class="login-heading"><p>WELCOME BACK</p><h2>账号登录</h2></div>
+        <label class="login-field" for="loginUsername"><span>账号</span><input id="loginUsername" v-model.trim="loginUsername" autocomplete="username" placeholder="请输入账号" required /></label>
+        <label class="login-field" for="loginPassword"><span>密码</span><input id="loginPassword" v-model="loginPassword" autocomplete="current-password" placeholder="请输入密码" required type="password" /></label>
+        <p v-if="loginError" class="login-error" role="alert">{{ loginError }}</p>
+        <button class="login-button" type="submit">进入系统</button>
+        <p class="login-note">NAURA DIGITAL MANUFACTURING</p>
+      </form>
+    </section>
+  </main>
+
+  <main v-else class="app-shell">
     <section class="workspace">
       <header class="topbar">
-        <div>
-          <p class="eyebrow">SolidWorks 2D Drawing Review</p>
-          <h1>机械设计图纸自动审查</h1>
+        <div class="product-identity">
+          <img src="/images/naura-logo.png" alt="北方华创 NAURA" />
+          <div><h1>智审图</h1><p>AI辅助机械设计图纸自动审查系统</p></div>
         </div>
-        <div class="status-pill" :class="{ offline: !isApiOnline }">{{ apiStatus }}</div>
+        <div class="topbar-actions">
+          <div class="system-status" :class="{ offline: !isApiOnline }"><span></span>{{ apiStatus }}</div>
+          <button class="logout-button" type="button" @click="signOut">退出登录</button>
+        </div>
       </header>
-
-      <section class="review-panel">
-        <form class="upload-box" @submit.prevent="submitReview">
-          <div>
-            <label>上传 PDF + DXF 图纸</label>
-            <p>PDF 用作和 SolidWorks 一致的显示底图；DXF 用于提取尺寸、文字和坐标进行审查。</p>
-          </div>
-          <div class="file-pair">
-            <label for="pdfFile">PDF 底图</label>
-            <input id="pdfFile" accept=".pdf,application/pdf" type="file" required @change="updateFile($event, 'pdf')" />
-          </div>
-          <div class="file-pair">
-            <label for="dxfFile">DXF 数据</label>
-            <input id="dxfFile" accept=".dxf,application/dxf" type="file" required @change="updateFile($event, 'dxf')" />
-          </div>
-          <button type="submit" :disabled="isSubmitting">
-            {{ isSubmitting ? "审查中..." : "开始审查" }}
-          </button>
-        </form>
-
-        <section class="summary-grid" aria-label="问题统计">
-          <article><span>总问题</span><strong>{{ summary.totalIssues }}</strong></article>
-          <article><span>Critical</span><strong>{{ summary.critical }}</strong></article>
-          <article><span>Warning</span><strong>{{ summary.warning }}</strong></article>
-          <article><span>Notice</span><strong>{{ summary.notice }}</strong></article>
-        </section>
-      </section>
 
       <p v-if="actionError" class="feedback error">{{ actionError }}</p>
 
-      <section class="content-grid">
-        <aside class="history-panel">
-          <div class="section-title">
-            <h2>审查记录</h2>
-            <button type="button" class="secondary-button" @click="loadHistory">刷新</button>
-          </div>
+      <template v-if="activeView === 'history'">
+        <section class="upload-panel">
+          <div class="panel-heading"><div><p class="eyebrow">NEW REVIEW</p><h2>创建审查任务</h2></div><span>上传 PDF 与 DXF 后生成审查报告</span></div>
+          <form class="upload-box" @submit.prevent="submitReview">
+            <label class="file-pair" for="pdfFile"><span>PDF 底图</span><input id="pdfFile" accept=".pdf,application/pdf" type="file" required @change="updateFile($event, 'pdf')" /></label>
+            <label class="file-pair" for="dxfFile"><span>DXF 数据</span><input id="dxfFile" accept=".dxf,application/dxf" type="file" required @change="updateFile($event, 'dxf')" /></label>
+            <button class="review-button" type="submit" :disabled="isSubmitting">{{ isSubmitting ? "审查中..." : "审查" }}</button>
+          </form>
+        </section>
+
+        <section class="history-panel">
+          <div class="panel-heading"><div><p class="eyebrow">REVIEW HISTORY</p><h2>审查记录</h2></div><span>{{ history.length }} 条记录</span></div>
           <p v-if="historyError" class="feedback error">{{ historyError }}</p>
-          <div v-else class="history-list">
-            <button
-              v-for="item in history"
-              :key="item.id"
-              class="history-item"
-              type="button"
-              @click="openReport(item.id)"
-            >
-              <strong>{{ item.file.name }}</strong>
-              <span>{{ item.summary.totalIssues }} 个问题 · {{ formatTime(item.createdAt) }}</span>
-            </button>
+          <div v-else class="history-table">
+            <div class="history-table-header"><span>图纸文件</span><span>审查时间</span><span>审查问题</span><span>操作</span></div>
+            <article v-for="item in history" :key="item.id" class="history-row">
+              <button class="history-main" type="button" @click="openReport(item.id)"><strong>{{ item.file.name }}</strong><span>查看报告详情</span></button>
+              <time>{{ formatTime(item.createdAt) }}</time>
+              <span class="issue-count">{{ item.summary.totalIssues }} 个</span>
+              <button class="delete-button" type="button" @click="deleteReview(item.id)">删除</button>
+            </article>
             <div v-if="history.length === 0" class="empty-state">暂无审查记录</div>
           </div>
-        </aside>
+        </section>
+      </template>
 
-        <section class="report-panel">
-          <div class="section-title">
-            <h2>报告详情</h2>
-            <span>{{ reportMeta }}</span>
+      <template v-else>
+        <div class="detail-nav"><button class="back-button" type="button" @click="activeView = 'history'">返回审查记录</button></div>
+        <section v-if="report" class="report-panel">
+          <div class="panel-heading"><div><p class="eyebrow">REVIEW REPORT</p><h2>报告详情</h2></div><span>{{ reportMeta }}</span></div>
+          <div class="report-summary">
+            <article><span>总问题</span><strong>{{ summary.totalIssues }}</strong></article>
+            <article><span>Critical</span><strong>{{ summary.critical }}</strong></article>
+            <article><span>Warning</span><strong>{{ summary.warning }}</strong></article>
+            <article><span>Notice</span><strong>{{ summary.notice }}</strong></article>
           </div>
           <div class="parser-meta">{{ parserMeta }}</div>
-          <div class="report-layout">
-            <section class="drawing-preview">
-              <template v-if="report?.visual?.available && report.visual.baseImage">
-                <div class="dxf-overlay-frame" :style="{ width: `${report.visual.width || 960}px`, height: `${report.visual.height || 640}px` }">
-                  <img class="pdf-base-image" :src="report.visual.baseImage" alt="PDF 图纸底图" />
-                  <div class="dxf-overlay-layer" v-html="report.visual.overlaySvg || ''"></div>
-                </div>
-              </template>
-              <template v-else-if="report?.visual?.available && report.visual.baseSvg">
-                <div class="dxf-overlay-frame" :style="{ width: `${report.visual.width || 960}px`, height: `${report.visual.height || 640}px` }">
-                  <div class="dxf-base-layer" v-html="report.visual.baseSvg"></div>
-                  <div class="dxf-overlay-layer" v-html="report.visual.overlaySvg || ''"></div>
-                </div>
-              </template>
-              <div v-else-if="report" class="visual-warning">{{ visualMessage(report.visual) }}</div>
-              <div v-else class="empty-state">上传一张图纸后，这里会显示可定位的图面标注。</div>
-            </section>
-
-            <section class="issue-list">
-              <template v-if="report?.issues?.length">
-                <article v-for="issue in report.issues" :key="issue.id || issue.code" class="issue-card" :class="issue.severity">
-                  <div class="issue-heading">
-                    <strong>{{ issue.title }}</strong>
-                    <span class="badge">{{ issue.severity }}</span>
-                  </div>
-                  <p>{{ issue.description }}</p>
-                  <p class="suggestion">{{ issue.suggestion }}</p>
-                  <p v-if="issue.evidence?.length">证据：{{ issue.evidence.join(" / ") }}</p>
-                </article>
-              </template>
-              <div v-else-if="report" class="empty-state">未发现明显尺寸审查问题。</div>
-              <div v-else class="empty-state">上传一张图纸后，这里会显示审查问题和修改建议。</div>
-            </section>
-          </div>
+          <section class="report-visual"><h3>图纸标注</h3>
+            <template v-if="report.visual?.available && report.visual.baseImage"><div class="dxf-overlay-frame" :style="{ width: `${report.visual.width || 960}px`, height: `${report.visual.height || 640}px` }"><img class="pdf-base-image" :src="report.visual.baseImage" alt="PDF 图纸底图" /><div class="dxf-overlay-layer" v-html="report.visual.overlaySvg || ''"></div></div></template>
+            <template v-else-if="report.visual?.available && report.visual.baseSvg"><div class="dxf-overlay-frame" :style="{ width: `${report.visual.width || 960}px`, height: `${report.visual.height || 640}px` }"><div class="dxf-base-layer" v-html="report.visual.baseSvg"></div><div class="dxf-overlay-layer" v-html="report.visual.overlaySvg || ''"></div></div></template>
+            <div v-else class="visual-warning">{{ visualMessage(report.visual) }}</div>
+          </section>
+          <section class="issue-section"><div class="issue-section-title"><h3>审查问题</h3><span>{{ report.issues.length }} 项</span></div>
+            <div v-if="report.issues.length" class="issue-list"><article v-for="issue in report.issues" :key="issue.id || issue.code" class="issue-card" :class="issue.severity"><div class="issue-heading"><strong>{{ issue.title }}</strong><span class="badge">{{ issue.severity }}</span></div><p>{{ issue.description }}</p><p class="suggestion">{{ issue.suggestion }}</p><p v-if="issue.evidence?.length">证据：{{ issue.evidence.join(" / ") }}</p></article></div>
+            <div v-else class="empty-state">未发现明显尺寸审查问题。</div>
+          </section>
         </section>
-      </section>
+      </template>
     </section>
   </main>
 </template>

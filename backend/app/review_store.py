@@ -43,6 +43,15 @@ class ReviewStore:
             reports.append(json.loads(path.read_text(encoding="utf-8")))
         return reports
 
+    def delete_report(self, review_id: str) -> None:
+        report_path = self.report_dir / f"{review_id}.json"
+        if not report_path.exists():
+            raise FileNotFoundError(review_id)
+
+        report_path.unlink()
+        for upload_path in self.upload_dir.glob(f"{review_id}-*"):
+            upload_path.unlink()
+
     def _safe_filename(self, filename: str) -> str:
         cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("._")
         return cleaned or "drawing"
