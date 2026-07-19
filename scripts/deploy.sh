@@ -1,7 +1,8 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="${0:A:h:h}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 
 command -v node >/dev/null || { echo "未找到 Node.js，请先安装 Node.js 20 或更高版本。"; exit 1; }
 command -v npm >/dev/null || { echo "未找到 npm。"; exit 1; }
