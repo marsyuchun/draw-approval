@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from .drawing_models import DrawingDimension
+from .drawing_models import DrawingDimension, DrawingLine, DrawingLocation, DrawingText, ParsedDrawing
 from .drawing_parser import ParserFactory
 from .pdf_parser import PdfParser
 from .pdf_preview_service import PdfPreviewService
@@ -45,6 +45,8 @@ class DrawingReviewEngine:
 
         dimensions = parsed.dimensions
         issues.extend(self._check_duplicate_dimensions(dimensions))
+        issues.extend(self._check_repeated_undimensioned_linear_features(parsed))
+        issues.extend(self._check_bushing_depth_clarity(parsed))
         issues.extend(self._check_invalid_dimensions(dimensions))
 
         if extension == PRIMARY_EXTENSION and not dimensions and not parsed.warnings:
@@ -90,6 +92,8 @@ class DrawingReviewEngine:
                     "DXF 矢量解析",
                     "PDF 兜底识别",
                     "重复尺寸标注检查",
+                    "重复几何间距缺失尺寸检查",
+                    "轴套深度表达完整性检查",
                     "非法尺寸值检查",
                     "真实坐标 SVG 标注",
                 ],
@@ -115,6 +119,8 @@ class DrawingReviewEngine:
 
         dimensions = parsed.dimensions
         issues.extend(self._check_duplicate_dimensions(dimensions))
+        issues.extend(self._check_repeated_undimensioned_linear_features(parsed))
+        issues.extend(self._check_bushing_depth_clarity(parsed))
         repeated_diameter_issues = self._check_repeated_diameter_dimensions(dimensions)
         issues.extend(repeated_diameter_issues)
         ignored_pdf_values = self._issue_dimension_values(repeated_diameter_issues)
@@ -131,6 +137,7 @@ class DrawingReviewEngine:
                     locations=[],
                 )
             )
+        issues = self._project_missing_dimension_locations_to_pdf(issues, parsed, pdf_parsed.texts)
         issues = self._prefer_pdf_locations(issues, pdf_parsed.texts)
 
         review_id = self._make_review_id(f"{dxf_filename}+{pdf_filename}", dxf_content + pdf_content)
@@ -161,6 +168,8 @@ class DrawingReviewEngine:
                     "PDF 矢量底图显示",
                     "DXF 矢量语义解析",
                     "重复尺寸标注检查",
+                    "重复几何间距缺失尺寸检查",
+                    "轴套深度表达完整性检查",
                     "非法尺寸值检查",
                     "PDF 文本层坐标 overlay 标注",
                 ],
@@ -202,6 +211,121 @@ class DrawingReviewEngine:
             first_location.bbox,
             second_location.bbox,
         )
+
+    def _check_repeated_undimensioned_linear_features(self, parsed: ParsedDrawing) -> list[dict[str, Any]]:
+        """Find repeated narrow contour gaps that have no matching linear dimension."""
+        scale = self._drawing_scale(parsed)
+        if scale is None or not parsed.lines:
+            return []
+
+        annotated_values = [dimension.value for dimension in parsed.dimensions if dimension.value > 0]
+        candidates = self._repeated_vertical_gap_candidates(parsed.lines, scale, annotated_values)
+        groups: dict[float, list[DrawingLocation]] = {}
+        for candidate in candidates:
+            groups.setdefault(candidate["value"], []).append(candidate["location"])
+
+        issues = []
+        for value, locations in groups.items():
+            if len(locations) < 2:
+                continue
+            issues.append(
+                self._issue(
+                    code="MISSING_LINEAR_DIMENSION",
+                    severity="Warning",
+                    title="疑似缺少线性尺寸标注",
+                    description=(
+                        f"DXF 轮廓中在 {len(locations)} 个视图位置发现相同的 {value:g} mm 并列边界间距，"
+                        f"但未找到 {value:g} mm 的线性尺寸标注。"
+                    ),
+                    suggestion="在其中一个能够清晰表达该特征的正投影视图中补充线性尺寸，并确认其他视图无需重复标注。",
+                    evidence=[f"{value:g} mm", f"{len(locations)} 处同值几何间距"],
+                    locations=[location.to_dict() for location in locations],
+                )
+            )
+        return issues
+
+    def _drawing_scale(self, parsed: ParsedDrawing) -> float | None:
+        for text in parsed.texts:
+            match = re.fullmatch(r"\s*1\s*[:：]\s*(\d+(?:\.\d+)?)\s*", text.value)
+            if match is not None:
+                return float(match.group(1))
+        return None
+
+    def _repeated_vertical_gap_candidates(
+        self,
+        lines: list[DrawingLine],
+        scale: float,
+        annotated_values: list[float],
+    ) -> list[dict[str, Any]]:
+        tolerance = 0.05
+        verticals = []
+        for line in lines:
+            if "图框" in line.layer:
+                continue
+            start_x, start_y = line.start
+            end_x, end_y = line.end
+            length = abs(end_y - start_y)
+            if abs(start_x - end_x) > tolerance or not 2 <= length <= 30:
+                continue
+            verticals.append(
+                {
+                    "x": start_x,
+                    "minY": min(start_y, end_y),
+                    "maxY": max(start_y, end_y),
+                }
+            )
+
+        candidates = []
+        for first_index, first in enumerate(verticals):
+            for second in verticals[first_index + 1 :]:
+                if abs(first["minY"] - second["minY"]) > tolerance or abs(first["maxY"] - second["maxY"]) > tolerance:
+                    continue
+                gap = abs(first["x"] - second["x"])
+                value = gap * scale
+                rounded_value = round(value)
+                if not 5 <= rounded_value <= 80 or abs(value - rounded_value) > 0.1:
+                    continue
+                if any(abs(dimension_value - rounded_value) <= 0.1 for dimension_value in annotated_values):
+                    continue
+                if not self._vertical_gap_has_connector(first, second, lines, tolerance):
+                    continue
+                candidates.append(
+                    {
+                        "value": float(rounded_value),
+                        "location": DrawingLocation(
+                            page=1,
+                            source="dxf",
+                            bbox={
+                                "x": min(first["x"], second["x"]),
+                                "y": first["minY"],
+                                "width": gap,
+                                "height": first["maxY"] - first["minY"],
+                            },
+                            text=f"{rounded_value:g} mm 未标注几何间距",
+                        ),
+                    }
+                )
+        return candidates
+
+    def _vertical_gap_has_connector(
+        self,
+        first: dict[str, float],
+        second: dict[str, float],
+        lines: list[DrawingLine],
+        tolerance: float,
+    ) -> bool:
+        min_x = min(first["x"], second["x"])
+        max_x = max(first["x"], second["x"])
+        for line in lines:
+            start_x, start_y = line.start
+            end_x, end_y = line.end
+            if abs(start_y - end_y) > tolerance:
+                continue
+            if not any(abs(start_y - edge_y) <= tolerance for edge_y in (first["minY"], first["maxY"])):
+                continue
+            if min(start_x, end_x) <= min_x + tolerance and max(start_x, end_x) >= max_x - tolerance:
+                return True
+        return False
 
     def _bbox_overlap_ratio(self, first: dict[str, float], second: dict[str, float]) -> float:
         left = max(float(first["x"]), float(second["x"]))
@@ -249,6 +373,145 @@ class DrawingReviewEngine:
     def _is_diameter_dimension(self, raw: str) -> bool:
         normalized = str(raw).lower()
         return "%%c" in normalized or "φ" in normalized or "dia" in normalized
+
+    def _check_bushing_depth_clarity(self, parsed: ParsedDrawing) -> list[dict[str, Any]]:
+        if any("剖" in text.value or "section" in text.value.lower() for text in parsed.texts):
+            return []
+
+        diameter_dimensions = [
+            dimension
+            for dimension in parsed.dimensions
+            if self._is_diameter_dimension(dimension.raw) and dimension.value > 0
+        ]
+        for first_index, first in enumerate(diameter_dimensions):
+            for second in diameter_dimensions[first_index + 1 :]:
+                if first.value == second.value:
+                    continue
+                if self._dimension_location_distance(first, second) > 45:
+                    continue
+                values = sorted({first.value, second.value})
+                return [
+                    self._issue(
+                        code="BUSHING_DEPTH_UNCLEAR",
+                        severity="Notice",
+                        title="轴套深度尺寸不明确",
+                        description=(
+                            f"检测到相邻的内外径尺寸 Φ{values[0]:g} 和 Φ{values[1]:g}，"
+                            "但图纸未发现剖视标识，轴套孔及台阶的有效深度无法确认。"
+                        ),
+                        suggestion="建议补充剖视图，并标注轴套孔深度、台阶深度及相关公差。",
+                        locations=[],
+                    )
+                ]
+        return []
+
+    def _dimension_location_distance(self, first: DrawingDimension, second: DrawingDimension) -> float:
+        first_center = self._bbox_center(first.location.bbox)
+        second_center = self._bbox_center(second.location.bbox)
+        return ((first_center[0] - second_center[0]) ** 2 + (first_center[1] - second_center[1]) ** 2) ** 0.5
+
+    def _project_missing_dimension_locations_to_pdf(
+        self,
+        issues: list[dict[str, Any]],
+        parsed: ParsedDrawing,
+        pdf_texts: list[DrawingText],
+    ) -> list[dict[str, Any]]:
+        transform = self._dxf_to_pdf_transform(parsed.dimensions, pdf_texts)
+        if transform is None:
+            return issues
+
+        for issue in issues:
+            if issue.get("code") != "MISSING_LINEAR_DIMENSION":
+                continue
+            projected_locations = []
+            for location in issue.get("locations", []):
+                if location.get("source") != "dxf":
+                    continue
+                projected_locations.append(self._project_dxf_location_to_pdf(location, transform))
+            if projected_locations:
+                issue["locations"] = projected_locations
+        return issues
+
+    def _dxf_to_pdf_transform(
+        self,
+        dimensions: list[DrawingDimension],
+        pdf_texts: list[DrawingText],
+    ) -> tuple[float, float, float, float] | None:
+        dxf_locations = self._unique_locations_by_dimension_text(
+            ((self._normalize_dimension_text(dimension.raw), dimension.location) for dimension in dimensions)
+        )
+        pdf_locations = self._unique_locations_by_dimension_text(
+            ((self._normalize_dimension_text(text.value), text.location) for text in pdf_texts)
+        )
+        matches = [
+            (dxf_locations[value], pdf_locations[value])
+            for value in dxf_locations.keys() & pdf_locations.keys()
+        ]
+        if len(matches) < 3:
+            return None
+
+        x_pairs = [(self._bbox_center(first.bbox)[0], self._bbox_center(second.bbox)[0]) for first, second in matches]
+        y_pairs = [(self._bbox_center(first.bbox)[1], self._bbox_center(second.bbox)[1]) for first, second in matches]
+        x_transform = self._fit_linear_transform(x_pairs)
+        y_transform = self._fit_linear_transform(y_pairs)
+        if x_transform is None or y_transform is None:
+            return None
+        x_scale, x_offset = x_transform
+        y_scale, y_offset = y_transform
+        if not 0.5 <= x_scale <= 6 or not -6 <= y_scale <= -0.5:
+            return None
+        return x_scale, x_offset, y_scale, y_offset
+
+    def _unique_locations_by_dimension_text(
+        self,
+        entries: Any,
+    ) -> dict[str, DrawingLocation]:
+        grouped: dict[str, list[DrawingLocation]] = {}
+        for value, location in entries:
+            if value:
+                grouped.setdefault(value, []).append(location)
+        return {value: locations[0] for value, locations in grouped.items() if len(locations) == 1}
+
+    def _fit_linear_transform(self, pairs: list[tuple[float, float]]) -> tuple[float, float] | None:
+        if len(pairs) < 2:
+            return None
+        source_mean = sum(source for source, _ in pairs) / len(pairs)
+        target_mean = sum(target for _, target in pairs) / len(pairs)
+        denominator = sum((source - source_mean) ** 2 for source, _ in pairs)
+        if denominator < 0.0001:
+            return None
+        scale = sum((source - source_mean) * (target - target_mean) for source, target in pairs) / denominator
+        return scale, target_mean - scale * source_mean
+
+    def _bbox_center(self, bbox: dict[str, float]) -> tuple[float, float]:
+        return float(bbox["x"]) + float(bbox["width"]) / 2, float(bbox["y"]) + float(bbox["height"]) / 2
+
+    def _project_dxf_location_to_pdf(
+        self,
+        location: dict[str, Any],
+        transform: tuple[float, float, float, float],
+    ) -> dict[str, Any]:
+        x_scale, x_offset, y_scale, y_offset = transform
+        bbox = location["bbox"]
+        x_values = [
+            x_scale * float(bbox["x"]) + x_offset,
+            x_scale * (float(bbox["x"]) + float(bbox["width"])) + x_offset,
+        ]
+        y_values = [
+            y_scale * float(bbox["y"]) + y_offset,
+            y_scale * (float(bbox["y"]) + float(bbox["height"])) + y_offset,
+        ]
+        return {
+            "page": location.get("page", 1),
+            "source": "pdf-dxf-geometry",
+            "bbox": {
+                "x": min(x_values),
+                "y": min(y_values),
+                "width": max(x_values) - min(x_values),
+                "height": max(y_values) - min(y_values),
+            },
+            "text": location.get("text", ""),
+        }
 
     def _prefer_pdf_locations(self, issues: list[dict[str, Any]], pdf_texts: list[Any]) -> list[dict[str, Any]]:
         if not pdf_texts:
